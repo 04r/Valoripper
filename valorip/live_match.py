@@ -497,49 +497,111 @@ def get_player_stats(username, tag):
             import traceback
             traceback.print_exc()
         
-        # Get match history stats - use by-season endpoint for accurate full act stats
-        # This endpoint gives aggregate stats for the entire season/act
-        season_url = f"https://api.henrikdev.xyz/valorant/v1/by-puuid/lifetime/matches/eu/{username_encoded}/{tag_encoded}?mode=competitive&size=51"
-        print(f"[DEBUG] Season stats URL: {season_url}")
+        # First, get the player's PUUID using the account endpoint
+        account_url = f"https://api.henrikdev.xyz/valorant/v1/account/{username_encoded}/{tag_encoded}"
+        print(f"[DEBUG] Account URL: {account_url}")
+        
+        player_puuid = None
+        try:
+            account_response = requests.get(account_url, headers=headers, timeout=10)
+            print(f"[DEBUG] Account status: {account_response.status_code}")
+            
+            if account_response.status_code == 200:
+                account_data = account_response.json()
+                if account_data.get('status') == 200:
+                    player_puuid = account_data.get('data', {}).get('puuid')
+                    print(f"[DEBUG] Found PUUID: {player_puuid[:8] if player_puuid else None}...")
+        except Exception as e:
+            print(f"[DEBUG] Account fetch failed: {e}")
+        
+        # If we couldn't get PUUID, skip match history
+        if not player_puuid:
+            print("[DEBUG] Could not fetch PUUID, skipping match history")
+            # Return stats if we got at least something from MMR
+            if any(v is not None for v in stats.values()):
+                return stats
+            return None
+        
+        # Get match history stats using v3 by-puuid endpoint with the actual PUUID
+        # Request more matches for better stats coverage (up to 100)
+        matches_url = f"https://api.henrikdev.xyz/valorant/v3/by-puuid/matches/eu/{player_puuid}?mode=competitive&size=100"
+        print(f"[DEBUG] Matches URL: {matches_url}")
         
         try:
-            season_response = requests.get(season_url, headers=headers, timeout=20)
-            print(f"[DEBUG] Season stats status: {season_response.status_code}")
+            matches_response = requests.get(matches_url, headers=headers, timeout=30)
+            print(f"[DEBUG] Matches status: {matches_response.status_code}")
             
-            if season_response.status_code == 200:
-                season_data = season_response.json()
-                if season_data.get('status') == 200:
-                    results = season_data.get('data', {}).get('results', [])
-                    print(f"[DEBUG] Found {len(results)} lifetime matches")
+            if matches_response.status_code == 200:
+                matches_data = matches_response.json()
+                if matches_data.get('status') == 200:
+                    matches_list = matches_data.get('data', [])
+                    print(f"[DEBUG] Found {len(matches_list)} recent matches")
                     
-                    # Get current act from MMR data (we already have it)
-                    current_act = None
-                    if seasonal and len(seasonal) > 0:
-                        current_act = seasonal[-1].get('season', {}).get('short')
+                    # Debug: Check structure of first match
+                    if matches_list and len(matches_list) > 0:
+                        first_match = matches_list[0]
+                        print(f"[DEBUG] First match keys: {list(first_match.keys())}")
+                        
+                        # Check players structure - it's likely a dict with team names as keys
+                        if 'players' in first_match:
+                            players_data = first_match['players']
+                            print(f"[DEBUG] Players type: {type(players_data)}")
+                            if isinstance(players_data, dict):
+                                print(f"[DEBUG] Players dict keys: {list(players_data.keys())}")
+                                # Get first team's players
+                                first_team = list(players_data.keys())[0]
+                                first_team_players = players_data[first_team]
+                                if isinstance(first_team_players, list) and len(first_team_players) > 0:
+                                    first_player = first_team_players[0]
+                                    print(f"[DEBUG] First player keys: {list(first_player.keys())}")
                     
-                    print(f"[DEBUG] Filtering for act: {current_act}")
-                    
-                    # Filter to current act only
+                    # Calculate stats from all recent matches
                     total_kills = 0
                     total_deaths = 0
                     total_hs = 0
                     total_body = 0
                     total_leg = 0
-                    act_match_count = 0
+                    match_count = 0
                     
-                    for match in results:
-                        match_meta = match.get('meta', {})
-                        match_season = match_meta.get('season', {}).get('short')
+                    for match in matches_list:
+                        players_data = match.get('players', {})
                         
-                        # Only count matches from current act
-                        if match_season == current_act:
-                            stats_data = match.get('stats', {})
-                            total_kills += stats_data.get('kills', 0)
-                            total_deaths += stats_data.get('deaths', 0)
-                            total_hs += stats_data.get('headshots', 0)
-                            total_body += stats_data.get('bodyshots', 0)
-                            total_leg += stats_data.get('legshots', 0)
-                            act_match_count += 1
+                        # Players is a dict with team names as keys (e.g., 'red', 'blue', 'all_players')
+                        # Skip 'all_players' to avoid double counting
+                        if isinstance(players_data, dict):
+                            found_in_match = False
+                            # Iterate through all teams (skip 'all_players' to avoid duplicates)
+                            for team_name, team_players in players_data.items():
+                                if team_name == 'all_players' or found_in_match:
+                                    continue
+                                    
+                                if not isinstance(team_players, list):
+                                    continue
+                                    
+                                for player in team_players:
+                                    if not isinstance(player, dict):
+                                        continue
+                                        
+                                    player_name = player.get('name', '')
+                                    player_tag = player.get('tag', '')
+                                    
+                                    # Match by name and tag
+                                    if player_name.lower() == username.lower() and player_tag.lower() == tag.lower():
+                                        stats_data = player.get('stats', {})
+                                        kills = stats_data.get('kills', 0)
+                                        deaths = stats_data.get('deaths', 0)
+                                        hs = stats_data.get('headshots', 0)
+                                        body = stats_data.get('bodyshots', 0)
+                                        leg = stats_data.get('legshots', 0)
+                                        
+                                        total_kills += kills
+                                        total_deaths += deaths
+                                        total_hs += hs
+                                        total_body += body
+                                        total_leg += leg
+                                        match_count += 1
+                                        found_in_match = True
+                                        break
                     
                     # Calculate stats
                     if total_deaths > 0:
@@ -549,10 +611,10 @@ def get_player_stats(username, tag):
                     if total_shots > 0:
                         stats['hs_rate'] = round((total_hs / total_shots) * 100, 1)
                     
-                    print(f"[DEBUG] Act totals from {act_match_count} matches - K:{total_kills} D:{total_deaths} HS:{total_hs}/{total_shots}")
+                    print(f"[DEBUG] Totals from {match_count} matches - K:{total_kills} D:{total_deaths} HS:{total_hs}/{total_shots}")
                     print(f"[DEBUG] Final stats - KD: {stats['kd']}, HS: {stats['hs_rate']}%")
         except Exception as e:
-            print(f"[DEBUG] Season stats fetch failed: {e}")
+            print(f"[DEBUG] Matches fetch failed: {e}")
             import traceback
             traceback.print_exc()
         
